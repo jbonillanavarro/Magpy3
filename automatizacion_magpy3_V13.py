@@ -19,6 +19,18 @@ DURACION_6MIN  =  6 * 60
 DURACION_30MIN = 30 * 60
 DURACION_2MIN  =  2 * 60
 
+# ── MODO DEPURACIÓN RÁPIDA ────────────────────────────────────────────────
+# Activar con la variable de entorno MAGPY_DEBUG_FAST=1 antes de ejecutar
+# el script (por ejemplo: set MAGPY_DEBUG_FAST=1  &&  py automatizacion_magpy3_V13.py)
+# Comprime las duraciones de medida para poder probar el flujo completo
+# (RMS + Peak + Excel) en segundos en vez de minutos. NO USAR EN CAMPO:
+# los valores resultantes no son validos para compliance con este modo activo.
+DEBUG_FAST = os.environ.get("MAGPY_DEBUG_FAST") == "1"
+if DEBUG_FAST:
+    DURACION_6MIN  = 30   # antes 360 s (6 min)
+    DURACION_30MIN = 30   # antes 1800 s (30 min)
+    DURACION_2MIN  = 15   # antes 120 s (2 min)
+
 LOCATIONS       = ["ProbeCenter", "SensorMax", "TipCenter", "TipMax"]
 QUANTITY_FILTRO = "IncidentMagneticField"
 
@@ -50,6 +62,13 @@ MEASUREMENTS_TIDY_COLUMNS = [
 MS_6MIN         =  6 * 60 * 1000
 MS_30MIN        = 30 * 60 * 1000
 MS_2MIN         =  2 * 60 * 1000
+
+if DEBUG_FAST:
+    # La ventana de promediado debe caber dentro de la duración real medida,
+    # si no, promediar_medidas() nunca tendría suficientes frames.
+    MS_6MIN  = DURACION_6MIN  * 1000
+    MS_30MIN = DURACION_30MIN * 1000
+    MS_2MIN  = DURACION_2MIN  * 1000
 
 CONFIG_REGION = {
     "CE": {
@@ -1105,11 +1124,77 @@ def promediar_medidas(filas_measurement, ms_ventana, ts_inicio_ms=None):
     msg(f"promediar_medidas: {len(df_v)} frames usados de {len(df)} totales "
         f"(ventana {ms_ventana/60000:.1f} min)", "OK")
 
+    # Deteccion de multi-frecuencia con TOLERANCIA RELATIVA (0.1%), no con
+    # igualdad exacta en punto flotante. El equipo tiene jitter de medida de
+    # la frecuencia frame a frame (variaciones de pocos kHz sobre una unica
+    # señal real), que con comparacion exacta se contaba como "frecuencias
+    # distintas" y disparaba avisos de multi-frecuencia falsos positivos.
+    TOLERANCIA_FRECUENCIA = 0.001   # 0.1% relativo
+    n_frecuencias_distintas = 0
+    grupos_frecuencia = []
+    if "frequency" in df_v and df_v["frequency"].notna().any():
+        freqs_ordenadas = sorted(df_v["frequency"].dropna().unique())
+        grupo_actual = [freqs_ordenadas[0]]
+        for f in freqs_ordenadas[1:]:
+            centro_grupo = sum(grupo_actual) / len(grupo_actual)
+            if abs(f - centro_grupo) / centro_grupo <= TOLERANCIA_FRECUENCIA:
+                grupo_actual.append(f)
+            else:
+                grupos_frecuencia.append(grupo_actual)
+                grupo_actual = [f]
+        grupos_frecuencia.append(grupo_actual)
+        n_frecuencias_distintas = len(grupos_frecuencia)
+
+    if n_frecuencias_distintas > 1:
+        conteo = df_v["frequency"].value_counts()
+        detalle_grupos = []
+        for grupo in grupos_frecuencia:
+            n_frames_grupo = sum(conteo.get(f, 0) for f in grupo)
+            centro = sum(grupo) / len(grupo)
+            detalle_grupos.append(
+                f"~{centro/1_000_000:.6f} MHz ({n_frames_grupo} frames, "
+                f"{n_frames_grupo/len(df_v)*100:.1f}%, {len(grupo)} lecturas distintas en el grupo)"
+            )
+        msg(f"Multi-frecuencia detectada ({n_frecuencias_distintas} grupos, "
+            f"tolerancia {TOLERANCIA_FRECUENCIA*100:.1f}%): " + ", ".join(detalle_grupos), "AVISO")
+
     return {
         "h_prom":    round(h_prom, 6) if h_prom is not None else None,
         "e_prom":    round(e_prom, 6) if e_prom is not None else None,
         "freq_hz":   freq_hz,
         "freq_mhz":  freq_mhz,
+        "multi_frecuencia": n_frecuencias_distintas > 1,
+    }
+
+
+def calcular_peak_desde_rms(prom_rms):
+    """
+    Deriva el valor Peak a partir de un promedio RMS ya calculado, usando
+    peak = RMS x sqrt(2). SOLO valido para senal monofrecuencia sinusoidal
+    con multi-frequency assessment deshabilitado (confirmado por soporte SPEAG).
+
+    Si prom_rms indica que se detecto mas de una frecuencia en la ventana,
+    NO se aplica el factor (se devuelve None en los campos de campo) para
+    evitar reportar un Peak matematicamente invalido.
+    """
+    SQRT2 = math.sqrt(2)
+    es_multi_freq = prom_rms.get("multi_frecuencia", False)
+
+    if es_multi_freq or prom_rms.get("h_prom") is None or prom_rms.get("e_prom") is None:
+        return {
+            "h_prom":   None,
+            "e_prom":   None,
+            "freq_hz":  prom_rms.get("freq_hz"),
+            "freq_mhz": prom_rms.get("freq_mhz"),
+            "multi_frecuencia": es_multi_freq,
+        }
+
+    return {
+        "h_prom":   round(prom_rms["h_prom"] * SQRT2, 6),
+        "e_prom":   round(prom_rms["e_prom"] * SQRT2, 6),
+        "freq_hz":  prom_rms.get("freq_hz"),
+        "freq_mhz": prom_rms.get("freq_mhz"),
+        "multi_frecuencia": False,
     }
 
 
@@ -1400,7 +1485,7 @@ def procesar_posicion(nombre_posicion, carpeta_raiz, regiones,
 
     if not iniciar_medida_con_reintentos(f"{nombre_posicion} - RMS"):
         colector_rms.detener()
-        return carpeta_posicion, None
+        return carpeta_posicion, None, None, distancia_cm
 
     fase_rms_label = f"{plan['duracion_rms_s']//60} min RMS"
     barra_progreso(plan["duracion_rms_s"], fase_rms_label)
@@ -1426,49 +1511,81 @@ def procesar_posicion(nombre_posicion, carpeta_raiz, regiones,
                 f"H: {prom.get('h_prom')} A/m | E: {prom.get('e_prom')} V/m", "OK")
 
     # ── FASE PEAK (solo si alguna región la necesita) ─────────────────────────
+    distancia_peak_cm = distancia_cm
     if plan["necesita_peak"]:
         regiones_peak = [r for r in regiones
                          if plan["ventanas"][r].get("Peak") is not None]
-        beep(1)
-        cuadro("CAMBIAR A MODO PEAK",
-               ["Pon Peak/RMS = Peak en MAGpy3 --> Configure --> Settings"])
-        enter("Presiona ENTER cuando hayas cambiado a Peak")
 
-        click_clear_gui()
-        time.sleep(2)
-        colector_peak = ColectorDatos(api_location=api_location)
-        colector_peak.iniciar()
+        distancia_peak_cm = pedir_numero(
+            "Distancia de medida PEAK (cm) -- igual que RMS si no cambia",
+            0.0, 200.0, distancia_cm
+        )
 
-        exito_peak = iniciar_medida_con_reintentos(f"{nombre_posicion} - Peak")
-        if not exito_peak:
-            colector_peak.detener()
+        if distancia_peak_cm == distancia_cm:
+            # Misma distancia: Peak = RMS x sqrt(2), sin medida fisica adicional.
+            # Solo valido para senal monofrecuencia sinusoidal con multi-frequency
+            # assessment deshabilitado (ver nota de dominio). Si la ventana RMS
+            # tiene mas de una frecuencia distinta, no se aplica el factor.
+            msg("Distancia PEAK = distancia RMS -> se calcula por RMS x sqrt(2), "
+                "sin repetir la medida.", "OK")
+            for r in regiones_peak:
+                prom_rms_r = promedios_por_region.get(r, {}).get("RMS")
+                if not prom_rms_r:
+                    continue
+                prom_peak_calc = calcular_peak_desde_rms(prom_rms_r)
+                promedios_por_region[r]["Peak"] = prom_peak_calc
+                if prom_peak_calc.get("multi_frecuencia"):
+                    msg(f"[{r}] PEAK no calculado: se detecto mas de una frecuencia "
+                        f"en la ventana RMS (multi-frequency). Revisar manualmente.", "AVISO")
+                else:
+                    msg(f"[{r}] PEAK (calculado, RMSx√2) -- "
+                        f"H: {prom_peak_calc.get('h_prom')} A/m | "
+                        f"E: {prom_peak_calc.get('e_prom')} V/m", "OK")
+            fecha_fin_peak = fecha_fin_rms
+        else:
+            # Distancia distinta: es una medida fisica distinta, hay que repetirla.
             beep(1)
-            cuadro("RESTABLECER MODO",
-                   ["Vuelve a poner Peak/RMS = RMS en MAGpy3 --> Configure settings"])
-            enter("Presiona ENTER cuando hayas vuelto a RMS")
-            return carpeta_posicion, None
+            cuadro("CAMBIAR A MODO PEAK",
+                   ["Pon Peak/RMS = Peak en MAGpy3 --> Configure --> Settings",
+                    f"Coloca la sonda a {distancia_peak_cm} cm (distancia PEAK)"])
+            enter("Presiona ENTER cuando hayas cambiado a Peak y reposicionado la sonda")
 
-        fase_peak_label = f"{plan['duracion_peak_s']//60} min Peak"
-        barra_progreso(plan["duracion_peak_s"], fase_peak_label)
-        fecha_fin_peak = datetime.now()
+            click_clear_gui()
+            time.sleep(2)
+            colector_peak = ColectorDatos(api_location=api_location)
+            colector_peak.iniciar()
 
-        parar_medida()
-        time.sleep(1)
-        colector_peak.detener()
-        time.sleep(0.5)
+            exito_peak = iniciar_medida_con_reintentos(f"{nombre_posicion} - Peak")
+            if not exito_peak:
+                colector_peak.detener()
+                beep(1)
+                cuadro("RESTABLECER MODO",
+                       ["Vuelve a poner Peak/RMS = RMS en MAGpy3 --> Configure settings"])
+                enter("Presiona ENTER cuando hayas vuelto a RMS")
+                return carpeta_posicion, None, None, distancia_peak_cm
 
-        capturar_pantalla(carpeta_posicion, fase_peak_label)
-        guardar_datos_zip(carpeta_posicion, fase_peak_label, colector_peak, api_location)
+            fase_peak_label = f"{plan['duracion_peak_s']//60} min Peak"
+            barra_progreso(plan["duracion_peak_s"], fase_peak_label)
+            fecha_fin_peak = datetime.now()
 
-        for r in regiones_peak:
-            ms_ventana_peak = plan["ventanas"][r]["Peak"]
-            prom = promediar_medidas(colector_peak.filas_measurement, ms_ventana_peak,
-                                     ts_inicio_ms=colector_peak.ts_inicio_ms)
-            if r not in promedios_por_region:
-                promedios_por_region[r] = {}
-            promedios_por_region[r]["Peak"] = prom
-            msg(f"[{r}] Peak ({ms_ventana_peak//60000} min) -- "
-                f"H: {prom.get('h_prom')} A/m | E: {prom.get('e_prom')} V/m", "OK")
+            parar_medida()
+            time.sleep(1)
+            colector_peak.detener()
+            time.sleep(0.5)
+
+            capturar_pantalla(carpeta_posicion, fase_peak_label)
+            guardar_datos_zip(carpeta_posicion, fase_peak_label, colector_peak, api_location)
+
+            for r in regiones_peak:
+                ms_ventana_peak = plan["ventanas"][r]["Peak"]
+                prom = promediar_medidas(colector_peak.filas_measurement, ms_ventana_peak,
+                                         ts_inicio_ms=colector_peak.ts_inicio_ms)
+                if r not in promedios_por_region:
+                    promedios_por_region[r] = {}
+                promedios_por_region[r]["Peak"] = prom
+                msg(f"[{r}] Peak medido ({ms_ventana_peak//60000} min, "
+                    f"distancia {distancia_peak_cm} cm) -- "
+                    f"H: {prom.get('h_prom')} A/m | E: {prom.get('e_prom')} V/m", "OK")
 
         beep(1)
         cuadro("RESTABLECER MODO",
@@ -1493,10 +1610,12 @@ def procesar_posicion(nombre_posicion, carpeta_raiz, regiones,
     beep(3)
     msg(f"Posicion '{nombre_posicion}' completada", "OK")
 
-    # Devolver promedios de la primera región como resumen CSV
+    # Devolver promedios de la primera región como resumen CSV (RMS y Peak si existe)
     prom_resumen = (promedios_por_region.get(regiones[0], {}).get("RMS")
                     or next(iter(promedios_por_region.values()), {}).get("RMS"))
-    return carpeta_posicion, prom_resumen
+    prom_peak_resumen = (promedios_por_region.get(regiones[0], {}).get("Peak")
+                         or next(iter(promedios_por_region.values()), {}).get("Peak"))
+    return carpeta_posicion, prom_resumen, prom_peak_resumen, distancia_peak_cm
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1741,7 +1860,8 @@ def pedir_configuracion_sesion():
                 continue
 
             ts_sesion   = datetime.now().strftime("%Y%m%d_%H%M%S")
-            archivo_csv = os.path.join(valores["carpeta_raiz"], f"promedios_{ts_sesion}.csv")
+            archivo_csv      = os.path.join(valores["carpeta_raiz"], f"promedios_{ts_sesion}.csv")
+            archivo_csv_peak = os.path.join(valores["carpeta_raiz"], f"peak_{ts_sesion}.csv")
             plan = calcular_plan_medida(valores["regiones"])
             nombres_regiones = ", ".join(CONFIG_REGION[r]["nombre"] for r in valores["regiones"])
 
@@ -1763,6 +1883,7 @@ def pedir_configuracion_sesion():
                 "wpt_client": valores["wpt_client"],
                 "battery": valores["battery"],
                 "archivo_csv": archivo_csv,
+                "archivo_csv_peak": archivo_csv_peak,
                 "plan": plan,
                 "nombres_regiones": nombres_regiones,
             }
@@ -1793,6 +1914,19 @@ def pedir_configuracion_sesion():
 def main():
     sep("AUTOMATIZACION DE MEDIDAS MAGpy3 + PROMEDIADO + EXCEL")
 
+    if DEBUG_FAST:
+        beep(3)
+        cuadro("!!! MODO DEPURACION RAPIDA ACTIVO (MAGPY_DEBUG_FAST=1) !!!",
+               [f"Duraciones comprimidas: RMS/FCC = {DURACION_30MIN}s, "
+                f"RMS 6min/2min = {DURACION_6MIN}s/{DURACION_2MIN}s",
+                "",
+                "LOS VALORES RESULTANTES NO SON VALIDOS PARA COMPLIANCE.",
+                "Usar solo para probar el flujo del script (Excel, CSV, hilos).",
+                "",
+                "Para desactivar: quita la variable de entorno MAGPY_DEBUG_FAST",
+                "y vuelve a ejecutar el script."])
+        enter("Presiona ENTER para continuar en modo depuracion")
+
     if not verificar_conexion():
         msg("Abre MAGpy3, verifica que el backend esta activo.", "ERROR")
         sys.exit(1)
@@ -1808,6 +1942,7 @@ def main():
     wpt_client       = config["wpt_client"]
     battery          = config["battery"]
     archivo_csv      = config["archivo_csv"]
+    archivo_csv_peak = config["archivo_csv_peak"]
     plan             = config["plan"]
     nombres_regiones = config["nombres_regiones"]
 
@@ -1821,12 +1956,13 @@ def main():
 
     sep("INICIO DE MEDIDAS")
     t_inicio  = datetime.now()
-    resultados = []
+    resultados      = []
+    resultados_peak = []
 
     for i in range(1, n_posiciones + 1):
         nombre_pos = pedir_nombre_posicion(i, n_posiciones)
         while True:
-            carpeta_pos, promedios = procesar_posicion(
+            carpeta_pos, promedios, promedios_peak, distancia_peak_usada = procesar_posicion(
                 nombre_pos, carpeta_raiz, regiones,
                 distancia_cm, frecuencia, ruta_excel,
                 technology, wpt_client, battery
@@ -1841,6 +1977,16 @@ def main():
                     "h_prom_A_m":     promedios.get("h_prom"),
                     "e_prom_V_m":     promedios.get("e_prom"),
                 })
+                if promedios_peak:
+                    resultados_peak.append({
+                        "posicion":       nombre_pos,
+                        "regiones":       "+".join(regiones),
+                        "distancia_cm":   distancia_peak_usada,
+                        "frecuencia_khz": frecuencia,
+                        "freq_mhz":       promedios_peak.get("freq_mhz"),
+                        "h_prom_A_m":     promedios_peak.get("h_prom"),
+                        "e_prom_V_m":     promedios_peak.get("e_prom"),
+                    })
                 break
 
             beep(2)
@@ -1856,9 +2002,13 @@ def main():
             if accion == "A":
                 msg("Sesion abortada. No se continuara con la siguiente posicion.", "ERROR")
                 guardar_csv_resumen(resultados, archivo_csv)
+                if resultados_peak:
+                    guardar_csv_resumen(resultados_peak, archivo_csv_peak)
                 sys.exit(1)
 
     guardar_csv_resumen(resultados, archivo_csv)
+    if resultados_peak:
+        guardar_csv_resumen(resultados_peak, archivo_csv_peak)
 
     t_fin = datetime.now()
     dur   = t_fin - t_inicio
@@ -1875,8 +2025,9 @@ def main():
             "",
             "Archivos generados:",
             f"  Carpeta raiz  -->  {carpeta_raiz}",
-            f"  CSV resumen   -->  {archivo_csv}",
-            f"  Excel         -->  {ruta_excel or 'No configurado'}"])
+            f"  CSV resumen   -->  {archivo_csv}"]
+           + ([f"  CSV Peak      -->  {archivo_csv_peak}"] if resultados_peak else [])
+           + [f"  Excel         -->  {ruta_excel or 'No configurado'}"])
 
     return
 
