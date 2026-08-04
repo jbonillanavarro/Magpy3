@@ -1639,14 +1639,28 @@ def procesar_posicion(nombre_posicion, carpeta_raiz, regiones,
 
             for r in regiones_peak:
                 ms_ventana_peak = plan["ventanas"][r]["Peak"]
-                prom = promediar_medidas(colector_peak.filas_measurement, ms_ventana_peak,
-                                         ts_inicio_ms=colector_peak.ts_inicio_ms)
+                prom_rms_en_posicion_peak = promediar_medidas(
+                    colector_peak.filas_measurement, ms_ventana_peak,
+                    ts_inicio_ms=colector_peak.ts_inicio_ms
+                )
+                # La API de MAGpy SIEMPRE devuelve RMS puro (confirmado por
+                # soporte SPEAG), sin importar si el equipo está en modo
+                # Peak/RMS por GUI -- ese toggle es solo de presentación.
+                # Por tanto, el valor medido aquí sigue siendo RMS real y
+                # hay que aplicar el mismo factor x√2 que en el camino de
+                # "misma distancia", para obtener el Peak reportable.
+                prom = calcular_peak_desde_rms(prom_rms_en_posicion_peak)
                 if r not in promedios_por_region:
                     promedios_por_region[r] = {}
                 promedios_por_region[r]["Peak"] = prom
-                msg(f"[{r}] Peak medido ({ms_ventana_peak//60000} min, "
-                    f"distancia {distancia_peak_cm} cm) -- "
-                    f"H: {prom.get('h_prom')} A/m | E: {prom.get('e_prom')} V/m", "OK")
+                if prom.get("multi_frecuencia"):
+                    msg(f"[{r}] PEAK no calculado: se detecto mas de una frecuencia "
+                        f"en la ventana medida en posicion Peak (multi-frequency). "
+                        f"Revisar manualmente.", "AVISO")
+                else:
+                    msg(f"[{r}] Peak (medido RMS en posicion Peak x√2, {ms_ventana_peak//60000} min, "
+                        f"distancia {distancia_peak_cm} cm) -- "
+                        f"H: {prom.get('h_prom')} A/m | E: {prom.get('e_prom')} V/m", "OK")
 
         beep(1)
         cuadro("RESTABLECER MODO",

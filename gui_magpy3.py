@@ -1,7 +1,7 @@
 """
 gui_magpy3.py
 ─────────────
-Interfaz gráfica (customtkinter) para automatizacion_magpy3_V14.py.
+Interfaz gráfica (customtkinter) para automatizacion_magpy3.py.
 
 DEPENDENCIA NUEVA: requiere 'customtkinter' (pip install customtkinter).
 La ventana ya no usa overrideredirect ni barra de título dibujada a
@@ -30,6 +30,7 @@ import os
 import sys
 import glob
 import queue
+import ctypes
 import threading
 import importlib.util
 import tkinter as tk
@@ -45,22 +46,40 @@ from datetime import datetime
 # python al azar, un fichero de prueba o una copia antigua dejada en
 # la carpeta podría acabar escribiendo mal el Excel de compliance sin
 # que el operador se entere. Preferimos fallar alto y claro.
-NOMBRE_CORE_ESPERADO = "automatizacion_magpy3_V14"
-RUTA_CORE_ESPERADA   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    NOMBRE_CORE_ESPERADO + ".py")
+
+def _carpeta_base():
+    """
+    Carpeta donde buscar el core y otros recursos junto a la app.
+
+    - Ejecutando como script normal (py gui_magpy3.py): la carpeta que
+      contiene este propio archivo.
+    - Empaquetado con PyInstaller --onefile SIN --add-data (el core se
+      deja como .py suelto junto al .exe, para poder actualizarlo sin
+      recompilar): hay que buscar junto a sys.executable (la carpeta
+      real donde vive AutoMagpy.exe), NO en sys._MEIPASS (que es solo
+      la carpeta temporal de autoextracción del propio .exe, y no
+      contiene archivos que no se hayan empaquetado explícitamente).
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+NOMBRE_CORE_ESPERADO = "automatizacion_magpy3"
+RUTA_CORE_ESPERADA   = os.path.join(_carpeta_base(), NOMBRE_CORE_ESPERADO + ".py")
 
 
 def _candidatos_automatizacion():
     """Otros scripts 'automatizacion_magpy3_*.py' presentes en la carpeta,
     para poder avisar con un mensaje útil si falta justo el esperado."""
-    carpeta = os.path.dirname(os.path.abspath(__file__))
+    carpeta = _carpeta_base()
     patron = os.path.join(carpeta, "automatizacion_magpy3_*.py")
     return sorted(os.path.basename(p) for p in glob.glob(patron))
 
 
 def cargar_core():
     """
-    Carga automatizacion_magpy3_V14.py desde la misma carpeta que gui_magpy3.py
+    Carga automatizacion_magpy3.py desde la misma carpeta que gui_magpy3.py
     (independiente del directorio de trabajo desde el que se lance 'py gui_magpy3.py').
     Si no está, lanza un error legible en vez de un ModuleNotFoundError críptico.
     """
@@ -114,10 +133,38 @@ import config_store
 eventos_q   = queue.Queue()   # (tipo, payload) generados por el hilo de trabajo
 respuesta_q = queue.Queue()   # respuestas que la GUI deposita para el hilo
 
+# Aborto global: independiente de respuesta_q. respuesta_q se usa para
+# distintas preguntas según el punto del flujo (nombre de posición,
+# reintentar tras fallo, valor numérico, contraseña...) y un "ABORTAR"
+# puesto ahí solo se interpretaba correctamente en los 2 puntos que
+# comprobaban ese valor a propósito; en cualquier otro punto en espera
+# (p.ej. dentro de un enter() intermedio durante la medición) el
+# "ABORTAR" se leía como una respuesta cualquiera y el flujo seguía
+# adelante. Este Event se comprueba en CADA punto de espera, sin
+# importar qué pregunta estuviera pendiente.
+sesion_abortada = threading.Event()
+
+
+class SesionAbortadaPorOperador(Exception):
+    """Señal interna: el operador pidió abortar mientras el hilo esperaba una respuesta."""
+    pass
+
 
 def _pedir_respuesta():
-    """Bloquea el hilo de trabajo hasta que la GUI deposite una respuesta."""
-    return respuesta_q.get()
+    """
+    Bloquea el hilo de trabajo hasta que la GUI deposite una respuesta,
+    o hasta que se solicite abortar la sesión desde cualquier punto.
+    """
+    while True:
+        try:
+            valor = respuesta_q.get(timeout=0.2)
+        except queue.Empty:
+            if sesion_abortada.is_set():
+                raise SesionAbortadaPorOperador()
+            continue
+        if sesion_abortada.is_set():
+            raise SesionAbortadaPorOperador()
+        return valor
 
 
 # ── Sustitutos de las primitivas de consola ───────────────────────────────
@@ -161,6 +208,9 @@ def gui_barra_progreso(segundos_total, etiqueta="Midiendo"):
     inicio = time.monotonic()
     eventos_q.put(("PROGRESO_INICIO", {"etiqueta": etiqueta, "segundos_total": segundos_total}))
     while True:
+        if sesion_abortada.is_set():
+            eventos_q.put(("PROGRESO_FIN", {}))
+            raise SesionAbortadaPorOperador()
         transcurrido = time.monotonic() - inicio
         pct = min(100, int(transcurrido / segundos_total * 100))
         restante = max(0, int(round(segundos_total - transcurrido)))
@@ -443,6 +493,16 @@ def hilo_sesion_medida(config):
             "ruta_excel": ruta_excel,
         }))
 
+    except SesionAbortadaPorOperador:
+        core.msg("Sesión abortada por el operador.", "ERROR")
+        try:
+            core.guardar_csv_resumen(resultados, archivo_csv)
+            if resultados_peak:
+                core.guardar_csv_resumen(resultados_peak, archivo_csv_peak)
+        except Exception:
+            pass  # si el aborto llegó antes de tener config/rutas listas, no hay nada que guardar
+        eventos_q.put(("SESION_ABORTADA", None))
+
     except Exception as e:
         eventos_q.put(("ERROR_FATAL", f"Error inesperado: {type(e).__name__}: {e}"))
 
@@ -604,8 +664,8 @@ class _BotonPrimario(ctk.CTkFrame):
 
 
 def _boton(parent, texto, command=None, primario=False, alto=44, ancho=None,
-          font=None, fg_color=None):
-    if primario:
+          font=None, fg_color=None, usar_frame=False):
+    if primario or usar_frame:
         return _BotonPrimario(parent, texto, command=command, alto=alto,
                               ancho=ancho, font=font, fg_color=fg_color)
     fg = fg_color or TOKEN_BG_INPUT
@@ -621,14 +681,65 @@ def _boton(parent, texto, command=None, primario=False, alto=44, ancho=None,
     btn.configure(fg_color=fg, hover_color=hover, text_color=txt)
     return btn
 
+
+# ═══════════════════════════════════════════════════════════════
+# TECLADO TÁCTIL (Windows) — abrir/cerrar TabTip.exe al enfocar/tocar
+# un campo de texto. En Windows 11 táctil sin teclado físico, el
+# Tablet Input Service a veces no auto-detecta el foco dentro de un
+# CTkEntry (dibujado sobre Canvas), así que se fuerza explícitamente.
+# ShellExecuteW respeta el contexto de sesión especial en el que corre
+# TabTip.exe; lanzarlo con subprocess.Popen no siempre funciona.
+# ═══════════════════════════════════════════════════════════════
+
+_RUTA_TABTIP = r"C:\Program Files\Common Files\Microsoft Shared\ink\TabTip.exe"
+
+
+def _abrir_teclado_tactil_windows():
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "open", _RUTA_TABTIP, None, None, 1)
+    except Exception:
+        pass
+
+
+def _cerrar_teclado_tactil_windows():
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess
+        subprocess.run(
+            ["taskkill", "/IM", "TabTip.exe", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def _bind_teclado_tactil(widget):
+    """Asocia apertura/cierre del teclado táctil a un CTkEntry (u otro widget de entrada)."""
+    if sys.platform != "win32":
+        return
+    entry_interno = getattr(widget, "_entry", widget)
+    for w in (widget, entry_interno):
+        try:
+            w.bind("<FocusIn>", lambda e: _abrir_teclado_tactil_windows(), add="+")
+            w.bind("<Button-1>", lambda e: _abrir_teclado_tactil_windows(), add="+")
+            w.bind("<FocusOut>", lambda e: _cerrar_teclado_tactil_windows(), add="+")
+        except Exception:
+            pass
+
+
 def _entrada(parent, textvariable, width=220, show=None, justify="left"):
-    return ctk.CTkEntry(
+    entry = ctk.CTkEntry(
         parent, textvariable=textvariable, width=width, height=38,
         corner_radius=RADIO_PILL, fg_color=TOKEN_BG_INPUT,
         border_width=BORDE_GROSOR, border_color=TOKEN_BORDER_SUBTLE,
         text_color=TOKEN_TEXT_PRIMARY, font=FUENTE_VALOR,
         show=show or "", justify=justify,
     )
+    _bind_teclado_tactil(entry)
+    return entry
 
 
 def _label(parent, texto, secundario=False, seccion=False, wraplength=None, font=None, **kw):
@@ -740,7 +851,11 @@ class DialogoModal(ctk.CTkToplevel):
         self.title(titulo)
         self.resizable(False, False)
         self.transient(master)
-        self.attributes("-topmost", True)
+        # NOTA: se quitó attributes("-topmost", True): en Windows, las
+        # ventanas always-on-top a veces no son reconocidas por el
+        # Tablet Input Service como candidatas a teclado táctil
+        # automático. transient() ya basta para mantener el diálogo
+        # por delante de la ventana principal.
         self._ancho_fijo = ancho   # guardado aparte: winfo_width() puede reportar
                                     # un valor ya encogido por Tk antes de ajustar_alto()
 
@@ -751,8 +866,8 @@ class DialogoModal(ctk.CTkToplevel):
 
         self.contenido = ctk.CTkFrame(self, fg_color=TOKEN_BG_MODAL, corner_radius=0,
                                       width=ancho)
-        self.contenido.pack(fill="both", expand=True, padx=20, pady=18)
-        self.contenido.pack_propagate(False)  # el ancho no lo decide el contenido interno
+        self.contenido.pack(fill="x", padx=20, pady=18)
+        self.contenido.pack_propagate(True)  # el alto SÍ lo decide el contenido interno; el ancho está fijado arriba
 
         self.update_idletasks()
         x = master.winfo_x() + (master.winfo_width() - ancho) // 2
@@ -760,7 +875,6 @@ class DialogoModal(ctk.CTkToplevel):
         self.geometry(f"{ancho}x1+{max(0,x)}+{max(0,y)}")
 
     def ajustar_alto(self):
-        self.contenido.pack_propagate(True)  # ya con todo el contenido creado, medir alto real
         self.update_idletasks()
         alto = self.winfo_reqheight()
         self.geometry(f"{self._ancho_fijo}x{alto}")
@@ -1032,7 +1146,8 @@ class AppMagpy3(ctk.CTk):
         frame_botones_paso = ctk.CTkFrame(cuerpo_paso, fg_color="transparent")
         frame_botones_paso.grid(row=2, column=0, sticky="e")
         self.btn_paso_abortar = _boton(frame_botones_paso, "Abortar sesión",
-                                       command=self._on_abortar_sesion, alto=48)
+                                       command=self._on_abortar_sesion, alto=48,
+                                       usar_frame=True, fg_color=TOKEN_BG_INPUT)
         self.btn_paso_abortar.pack(side="right", padx=(0, 10))
         self.btn_paso_continuar = _boton(frame_botones_paso, "Continuar",
                                          command=self._on_paso_continuar,
@@ -1069,11 +1184,8 @@ class AppMagpy3(ctk.CTk):
         _label(cuerpo_fin, "¿Qué quieres hacer ahora?").pack(anchor="w", pady=(0, 10))
         frame_botones_fin = ctk.CTkFrame(cuerpo_fin, fg_color="transparent")
         frame_botones_fin.pack(anchor="w")
-        _boton(frame_botones_fin, "Nueva sesión (mismos datos)", primario=True, alto=44,
-              command=lambda: self._on_nueva_sesion(reutilizar_datos=True)).pack(side="left")
-        _boton(frame_botones_fin, "Nueva sesión (cambiar configuración)", alto=44,
-              command=lambda: self._on_nueva_sesion(reutilizar_datos=False))\
-            .pack(side="left", padx=(10, 0))
+        _boton(frame_botones_fin, "Nueva sesión", primario=True, alto=44,
+              command=self._on_nueva_sesion).pack(side="left")
 
         _label(f, "Registro de la sesión:").pack(anchor="w", pady=(6, 6))
         frame_log = ctk.CTkFrame(f, fg_color=TOKEN_BG_INPUT, corner_radius=RADIO_PILL,
@@ -1093,8 +1205,10 @@ class AppMagpy3(ctk.CTk):
 
     def _iniciar_flujo_medida(self, config):
         config_store.guardar_perfil(config)
+        sesion_abortada.clear()   # nueva sesión: limpiar cualquier aborto de una sesión anterior
         self.frame_formulario.grid_forget()
         self.frame_sesion.grid(row=0, column=0, sticky="nsew")
+        self.btn_paso_abortar.configure(state="normal")
         self._log("Iniciando sesión de medida…", "INFO")
         self.hilo = threading.Thread(target=hilo_sesion_medida, args=(config,), daemon=True)
         self.hilo.start()
@@ -1120,7 +1234,6 @@ class AppMagpy3(ctk.CTk):
 
     def _on_paso_continuar(self):
         self.btn_paso_continuar.configure(state="disabled")
-        self.btn_paso_abortar.configure(state="disabled")
         self.lbl_paso_titulo.configure(text="—")
         self.lbl_paso_texto.configure(text="Sin acciones pendientes.")
         respuesta_q.put(None)
@@ -1131,7 +1244,22 @@ class AppMagpy3(ctk.CTk):
             return
         self.btn_paso_continuar.configure(state="disabled")
         self.btn_paso_abortar.configure(state="disabled")
-        respuesta_q.put("ABORTAR")
+        sesion_abortada.set()      # corta el hilo en CUALQUIER punto de espera, no solo aquí
+        respuesta_q.put("ABORTAR")  # además, por si el hilo está en uno de los 2 puntos
+                                     # que ya comprueban este valor explícitamente
+
+        # Detener la adquisición REAL en el equipo MAGpy vía API. Cortar
+        # el hilo de Python no detiene la medida en el hardware: hay que
+        # avisar explícitamente al endpoint acquisition/stop. Se lanza
+        # en un hilo aparte porque parar_medida() tiene reintentos con
+        # time.sleep() y no debe bloquear la GUI.
+        threading.Thread(target=self._detener_adquisicion_magpy, daemon=True).start()
+
+    def _detener_adquisicion_magpy(self):
+        try:
+            core.parar_medida()
+        except Exception as e:
+            eventos_q.put(("LOG", (f"No se pudo confirmar el paro de adquisición en MAGpy: {e}", "ERROR")))
 
     # ── Nombre de posición ───────────────────────────────────────────────
 
@@ -1195,7 +1323,8 @@ class AppMagpy3(ctk.CTk):
 
         frame_botones = ctk.CTkFrame(cont, fg_color="transparent")
         frame_botones.pack(fill="x", pady=(18, 0))
-        _boton(frame_botones, "Cancelar", command=_cancelar, alto=46).pack(side="right")
+        _boton(frame_botones, "Cancelar", command=_cancelar, alto=46,
+              usar_frame=True, fg_color=TOKEN_BG_INPUT).pack(side="right")
         _boton(frame_botones, "Aceptar", command=_aceptar, primario=True, alto=46)\
             .pack(side="right", padx=(0, 8))
 
@@ -1271,7 +1400,6 @@ class AppMagpy3(ctk.CTk):
             self._pendiente_repetir = False
             self.btn_paso_continuar.configure(text="Continuar")
             self.btn_paso_continuar.configure(state="disabled")
-            self.btn_paso_abortar.configure(state="disabled")
             respuesta_q.put("REPETIR")
         else:
             self._on_paso_continuar()
@@ -1329,8 +1457,8 @@ class AppMagpy3(ctk.CTk):
         self.frame_nombre_pos.pack_forget()
         self.frame_fin_sesion.pack(fill="x", pady=(12, 0))
 
-    def _on_nueva_sesion(self, reutilizar_datos):
-        if reutilizar_datos and getattr(self, "config_sesion", None):
+    def _on_nueva_sesion(self):
+        if getattr(self, "config_sesion", None):
             self._rellenar_formulario_desde_config(self.config_sesion)
 
         self.frame_fin_sesion.pack_forget()
