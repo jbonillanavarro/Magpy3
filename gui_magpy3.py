@@ -1,7 +1,7 @@
 """
 gui_magpy3.py
 ─────────────
-Interfaz gráfica (customtkinter) para automatizacion_magpy3.py.
+Interfaz gráfica (customtkinter) para automatizacion_magpy3_V14.py.
 
 DEPENDENCIA NUEVA: requiere 'customtkinter' (pip install customtkinter).
 La ventana ya no usa overrideredirect ni barra de título dibujada a
@@ -53,19 +53,17 @@ def _carpeta_base():
 
     - Ejecutando como script normal (py gui_magpy3.py): la carpeta que
       contiene este propio archivo.
-    - Empaquetado con PyInstaller --onefile SIN --add-data (el core se
-      deja como .py suelto junto al .exe, para poder actualizarlo sin
-      recompilar): hay que buscar junto a sys.executable (la carpeta
-      real donde vive AutoMagpy.exe), NO en sys._MEIPASS (que es solo
-      la carpeta temporal de autoextracción del propio .exe, y no
-      contiene archivos que no se hayan empaquetado explícitamente).
+    - Empaquetado con PyInstaller --onefile: __file__ ya no vive en una
+      carpeta de proyecto real (el .exe se autoextrae a una carpeta
+      temporal en tiempo de ejecución, expuesta en sys._MEIPASS). Si el
+      core se incluyó como dato al empaquetar (--add-data), aparece ahí.
     """
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
 
 
-NOMBRE_CORE_ESPERADO = "automatizacion_magpy3"
+NOMBRE_CORE_ESPERADO = "automatizacion_magpy3_V14"
 RUTA_CORE_ESPERADA   = os.path.join(_carpeta_base(), NOMBRE_CORE_ESPERADO + ".py")
 
 
@@ -79,7 +77,7 @@ def _candidatos_automatizacion():
 
 def cargar_core():
     """
-    Carga automatizacion_magpy3.py desde la misma carpeta que gui_magpy3.py
+    Carga automatizacion_magpy3_V14.py desde la misma carpeta que gui_magpy3.py
     (independiente del directorio de trabajo desde el que se lance 'py gui_magpy3.py').
     Si no está, lanza un error legible en vez de un ModuleNotFoundError críptico.
     """
@@ -108,8 +106,10 @@ def cargar_core():
     return modulo
 
 
+print("DEBUG 1: antes de cargar_core()", flush=True)
 try:
     core = cargar_core()
+    print("DEBUG 2: core cargado OK", flush=True)
 except FileNotFoundError as e:
     # Tkinter aún no tiene ventana principal creada; usamos un diálogo
     # mínimo para mostrar el error igualmente, con consola como respaldo.
@@ -123,7 +123,9 @@ except FileNotFoundError as e:
         pass
     sys.exit(1)
 
+print("DEBUG 3: antes de import config_store", flush=True)
 import config_store
+print("DEBUG 4: config_store importado OK", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1549,13 +1551,18 @@ def instalar_monkeypatches():
 
 
 def main():
+    print("DEBUG 5: entrando en main()", flush=True)
     instalar_monkeypatches()
+    print("DEBUG 6: monkeypatches instalados OK", flush=True)
 
     if not core.DEBUG_FAST and os.environ.get("MAGPY_DEBUG_FAST") == "1":
         core.DEBUG_FAST = True
 
+    print("DEBUG 7: antes de crear AppMagpy3()", flush=True)
     app = AppMagpy3()
+    print("DEBUG 8: AppMagpy3 creada OK, entrando en mainloop", flush=True)
     app.mainloop()
+    print("DEBUG 9: mainloop terminó (ventana cerrada)", flush=True)
 
 
 if __name__ == "__main__":
